@@ -1,0 +1,92 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// --- CONFIGURATION ---
+const char* ssid = "PhantomSaver_AP";
+const char* password = "password123"; 
+const int RELAY_PIN = 5; 
+const int ACS712_PIN = 34;
+
+WebServer server(80);
+
+// --- VARIABLES ---
+unsigned long lowCurrentStartTime = 0;
+bool isRelayOn = true;
+float currentAmps = 0.0;
+
+void handleData() {
+  String json = "{\"current\":" + String(currentAmps) + 
+                ",\"relayStatus\":" + String(isRelayOn ? 1 : 0) + "}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT);
+  
+  // NOTE: Some relay modules are 'Active Low'. 
+  // If your relay turns OFF when it should be ON, change HIGH to LOW here.
+  digitalWrite(RELAY_PIN, HIGH); 
+
+  WiFi.softAP(ssid, password);
+  Serial.println("Access Point Started: " + String(ssid));
+  server.on("/data", handleData);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  // --- RMS SAMPLING ---
+  float maxValue = 0;
+  float minValue = 4095;
+  uint32_t start_time = millis();
+  while((millis() - start_time) < 20) {
+    int readValue = analogRead(ACS712_PIN);
+    if (readValue > maxValue) maxValue = readValue;
+    if (readValue < minValue) minValue = readValue;
+  }
+
+  float Vpp = ((maxValue - minValue) * 3.3) / 4095.0;
+  float vRMS = (Vpp / 2.0) * 0.707;
+  float ampreRMS = vRMS / 0.185; 
+
+  // Filter noise
+  if (ampreRMS < 0.12) { 
+    currentAmps = 0.0; 
+  } else {
+    currentAmps = ampreRMS;
+  }
+
+  // --- REVISED RELAY LOGIC ---
+  // If current is effectively 0 or very low (Phantom load)
+  if (currentAmps < 0.35) { 
+    if (lowCurrentStartTime == 0) {
+      lowCurrentStartTime = millis();
+      Serial.println("Threshold detected. Timer started...");
+    } else {
+      float elapsed = (millis() - lowCurrentStartTime) / 1000.0;
+      Serial.print("Time in low current: "); Serial.print(elapsed); Serial.println("s / 10s");
+      
+      if (elapsed > 10.0) { 
+        digitalWrite(RELAY_PIN, LOW); // TRIP
+        isRelayOn = false;
+        Serial.println("!!! RELAY TRIPPED !!!");
+      }
+    }
+  } 
+  // If high current detected (Load is actually being used)
+  else {
+    if (!isRelayOn) {
+       Serial.println("Load detected. Resetting Relay to ON.");
+    }
+    lowCurrentStartTime = 0;
+    digitalWrite(RELAY_PIN, HIGH); 
+    isRelayOn = true;
+  }
+
+  Serial.print("Current: "); Serial.print(currentAmps);
+  Serial.print("A | Relay Status: "); Serial.println(isRelayOn ? "ON" : "OFF");
+  
+  delay(100); 
+}
