@@ -4,15 +4,22 @@
 // --- CONFIGURATION ---
 const char* ssid = "PhantomSaver_AP";
 const char* password = "password123"; 
-const int RELAY_PIN = 5; 
+const int RELAY_PIN = 23; 
 const int ACS712_PIN = 34;
 
 WebServer server(80);
 
 // --- VARIABLES ---
 unsigned long lowCurrentStartTime = 0;
+unsigned long lastPulseTime = 0;
 bool isRelayOn = true;
 float currentAmps = 0.0;
+const unsigned long PULSE_INTERVAL = 10000; 
+
+// --- UPDATED THRESHOLD ---
+// Since your cooler reads ~0.34A, we set the cutoff lower.
+// Anything below 0.15A will be treated as "Phantom/Off".
+const float CUTOFF_THRESHOLD = 0.15; 
 
 void handleData() {
   String json = "{\"current\":" + String(currentAmps) + 
@@ -22,22 +29,21 @@ void handleData() {
 
 void setup() {
   Serial.begin(115200);
+  delay(1000); 
+  
   pinMode(RELAY_PIN, OUTPUT);
   
-  // NOTE: Some relay modules are 'Active Low'. 
-  // If your relay turns OFF when it should be ON, change HIGH to LOW here.
-  digitalWrite(RELAY_PIN, HIGH); 
+  // Start with Relay ON (Inverted logic: LOW = ON)
+  digitalWrite(RELAY_PIN, LOW); 
+  isRelayOn = true;
 
   WiFi.softAP(ssid, password);
-  Serial.println("Access Point Started: " + String(ssid));
   server.on("/data", handleData);
   server.begin();
+  Serial.println(">>> THRESHOLD ADJUSTED TO 0.15A <<<");
 }
 
-void loop() {
-  server.handleClient();
-
-  // --- RMS SAMPLING ---
+float getRMSCurrent() {
   float maxValue = 0;
   float minValue = 4095;
   uint32_t start_time = millis();
@@ -46,47 +52,58 @@ void loop() {
     if (readValue > maxValue) maxValue = readValue;
     if (readValue < minValue) minValue = readValue;
   }
-
   float Vpp = ((maxValue - minValue) * 3.3) / 4095.0;
   float vRMS = (Vpp / 2.0) * 0.707;
+  
+  // Note: 0.185 is for the 5A sensor. 
+  // If your reading of 0.34A is wrong, we might need to change this to 0.066 (30A).
   float ampreRMS = vRMS / 0.185; 
+  return (ampreRMS < 0.08) ? 0.0 : ampreRMS;
+}
 
-  // Filter noise
-  if (ampreRMS < 0.12) { 
-    currentAmps = 0.0; 
-  } else {
-    currentAmps = ampreRMS;
-  }
+void loop() {
+  server.handleClient();
+  currentAmps = getRMSCurrent();
+  unsigned long currentTime = millis();
 
-  // --- REVISED RELAY LOGIC ---
-  // If current is effectively 0 or very low (Phantom load)
-  if (currentAmps < 0.35) { 
-    if (lowCurrentStartTime == 0) {
-      lowCurrentStartTime = millis();
-      Serial.println("Threshold detected. Timer started...");
-    } else {
-      float elapsed = (millis() - lowCurrentStartTime) / 1000.0;
-      Serial.print("Time in low current: "); Serial.print(elapsed); Serial.println("s / 10s");
-      
-      if (elapsed > 10.0) { 
-        digitalWrite(RELAY_PIN, LOW); // TRIP
+  if (isRelayOn) {
+    // MONITORING: Trip if current drops below our new threshold
+    if (currentAmps < CUTOFF_THRESHOLD) { 
+      if (lowCurrentStartTime == 0) lowCurrentStartTime = currentTime;
+      else if (currentTime - lowCurrentStartTime > 10000) {
+        Serial.println("!!! PHANTOM DETECTED - TRIPPING !!!");
+        delay(100); 
+        digitalWrite(RELAY_PIN, HIGH); // OFF
         isRelayOn = false;
-        Serial.println("!!! RELAY TRIPPED !!!");
+        lastPulseTime = currentTime;
+        delay(500); 
+      }
+    } else {
+      lowCurrentStartTime = 0; // Current is healthy, reset timer
+    }
+  } else {
+    // PULSE CHECK: Every 30s, see if someone turned the cooler back ON
+    if (currentTime - lastPulseTime > PULSE_INTERVAL) {
+      Serial.println("PULSING: Checking load...");
+      digitalWrite(RELAY_PIN, LOW); // ON
+      delay(800); 
+      
+      float checkCurrent = getRMSCurrent();
+      if (checkCurrent >= CUTOFF_THRESHOLD) { 
+        isRelayOn = true;
+        lowCurrentStartTime = 0;
+        Serial.println("COOLER DETECTED: STAYING ON");
+      } else {
+        digitalWrite(RELAY_PIN, HIGH); // BACK TO OFF
+        lastPulseTime = millis();
+        Serial.println("STILL NO LOAD: SAVING POWER");
+        delay(500);
       }
     }
-  } 
-  // If high current detected (Load is actually being used)
-  else {
-    if (!isRelayOn) {
-       Serial.println("Load detected. Resetting Relay to ON.");
-    }
-    lowCurrentStartTime = 0;
-    digitalWrite(RELAY_PIN, HIGH); 
-    isRelayOn = true;
   }
 
   Serial.print("Current: "); Serial.print(currentAmps);
-  Serial.print("A | Relay Status: "); Serial.println(isRelayOn ? "ON" : "OFF");
+  Serial.print("A | Relay: "); Serial.println(isRelayOn ? "ON" : "OFF");
   
-  delay(100); 
+  delay(200);
 }
